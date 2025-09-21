@@ -1,6 +1,7 @@
-import { RecipeModel } from "./page.js";
+import { RecipeModel, OverclockResult } from "./page.js";
 import { Fluid, Goods, Item, Recipe, RecipeInOut, RecipeIoType, RecipeType, Repository } from "./repository.js";
-import { TIER_LV, TIER_UEV } from "./utils.js";
+import { TIER_LV, TIER_LUV, TIER_ZPM, TIER_UV, TIER_UHV, TIER_UEV } from "./utils.js";
+import { voltageTier } from "./utils.js";
 
 export type MachineCoefficient = number | ((recipe:RecipeModel, choices:{[key:string]:number}) => number);
 
@@ -8,13 +9,19 @@ const MAX_OVERCLOCK = Number.POSITIVE_INFINITY;
 
 export type Machine = {
     choices?: {[key:string]:Choice};
-    perfectOverclock: MachineCoefficient;
+    enforceChoiceConstraints?: (recipe:RecipeModel, choices:{[key:string]:number}) => void;
+    perfectOverclock?: MachineCoefficient;
     speed: MachineCoefficient;
     power: MachineCoefficient;
     parallels: MachineCoefficient;
+    customOverclock?: (recipeModel:RecipeModel, overclockTiers:number) => OverclockResult;
     recipe?: (recipe:RecipeModel, choices:{[key:string]:number}, items:RecipeInOut[]) => RecipeInOut[];
-    overclockDoesNotAffectSpeed?: boolean;
     info?: string;
+    ignoreParallelLimit?: boolean;
+}
+
+function noOverclock(recipeModel:RecipeModel, overclockTiers:number): OverclockResult {
+    return {overclockSpeed:1, overclockPower:1, perfectOverclocks:0};
 }
 
 export type Choice = {
@@ -183,16 +190,15 @@ machines["Naquadah Fuel Refinery"] = {
 };
 
 machines["Neutron Activator"] = {
-    perfectOverclock: 0,
     speed: (recipe, choices) => Math.pow((1/0.9), (choices.speedingPipeCasing - 4)),
     power: 0,
     parallels: 1,
+    customOverclock: noOverclock,
     choices: {speedingPipeCasing: {
         description: "Speeding Pipe Casing",
         min: 4,
     }},
     info: "Power calculation is not implemented.",
-    overclockDoesNotAffectSpeed: true,
 };
 
 machines["Precise Auto-Assembler MT-3662"] = {
@@ -307,7 +313,7 @@ machines["Electric Blast Furnace"] = {
         for (let i=0; i<items.length; i++) {
             let item = items[i];
             if (item.type == RecipeIoType.FluidOutput && item.goods instanceof Fluid && 
-                (item.goods.name == "CO2 gas" || item.goods.name == "Sulfur Dioxide" || item.goods.name == "Carbon Monoxide")) {
+                (item.goods.name == "CO2 Gas" || item.goods.name == "Sulfur Dioxide" || item.goods.name == "Carbon Monoxide")) {
                 items = createEditableCopy(items);
                 items[i].amount = choices.muffler * item.amount * 0.125;
                 break;
@@ -453,12 +459,64 @@ machines["Assembly Line"] = {
     parallels: 1,
 };
 
+function laserOverclockCalculator(recipeModel:RecipeModel, overclockTiers:number): OverclockResult {
+    const amperage = recipeModel.choices.inputAmperage;
+    const availableEut = voltageTier[recipeModel.voltageTier].voltage * amperage;
+    let currentEut = (recipeModel.recipe?.gtRecipe?.voltage || 32) * recipeModel.getItemInputCount();
+    
+    let overclockSpeed = 1;
+    let overclockPower = 1;
+
+    const maxRegularOverclocks = recipeModel.voltageTier - (recipeModel.recipe?.gtRecipe?.voltageTier || TIER_LV);
+    let regularOverclocks = 0;
+    while (currentEut * 4 < availableEut && regularOverclocks < maxRegularOverclocks) {
+        currentEut *= 4;
+        overclockSpeed *= 2;
+        overclockPower *= 2;
+        regularOverclocks += 1;
+    }
+
+    let laserOverclocks = 0;
+    while (true) {
+        const multiplier = 4.0 + 0.3 * (laserOverclocks + 1);
+        const potentialEU = currentEut * multiplier;
+
+        if (potentialEU >= availableEut) break;
+
+        currentEut = potentialEU;
+        overclockSpeed *= 2;
+        overclockPower *= multiplier / 2;
+        laserOverclocks += 1;
+
+        if (laserOverclocks + regularOverclocks > overclockTiers + (Math.log(amperage) / Math.log(4))) break;
+    }
+
+    let overclockNameParts = new Array();
+    if (regularOverclocks > 0) {
+        overclockNameParts.push("OC x" + regularOverclocks);
+    }
+
+    if (laserOverclocks > 0 ) {
+        overclockNameParts.push("Laser OC x" + laserOverclocks);
+    }
+
+    return {
+        overclockSpeed : overclockSpeed, 
+        overclockPower : overclockPower, 
+        perfectOverclocks : 0,
+        overclockName : overclockNameParts.join(", ")
+    };
+};
+
 machines["Advanced Assembly Line"] = {
     perfectOverclock: 0,
-    speed: 1, // TODO
-    power: 1, // TODO
-    parallels: 1,
-    info: "Laser overclocks and slices logic not implemented.",
+    speed: 1,
+    power: 1,
+    customOverclock: laserOverclockCalculator,
+    parallels: (recipe) => recipe.getItemInputCount(),
+    ignoreParallelLimit: true, // prevent parallel limitation as solver does not understand separate ampearage
+    choices: {inputAmperage: {description: "Input Amperage", min: 16}},
+    info: "NOTE: Voltage determines the energy hatch voltage, not maximum voltage. WARNING: Calculates beyond 1 slice per tick.",
 };
 
 machines["Large Fluid Extractor"] = {
@@ -614,13 +672,143 @@ machines["PCB Factory"] = {
     info: "Production multiplier based on trace size is not implemented.",
 };
 
+class DtpfCatalyst {
+    tier: number;
+    name: string;
+    id: string;
+    euPerLiter: number;
+    residuePerLiter: number;
+
+    constructor(tier: number, name: string, id: string, euPerLiter: number, residuePerLiter: number) {
+        this.tier = tier;
+        this.name = name;
+        this.id = id;
+        this.euPerLiter = euPerLiter;
+        this.residuePerLiter = residuePerLiter;
+    }
+
+    public getCompactName() {
+        const regex = /^Excited Dimensionally Transcendent (.+?) Catalyst$/;
+        const match = this.name.match(regex);
+        if (!match) {
+            throw new Error(`Cannot compactify non-standard DTPF catalyst name: "${self.name}"`);
+        }
+        return match[1];
+    }
+}
+
+let DtpfCatalysts = [
+    new DtpfCatalyst(0, "Excited Dimensionally Transcendent Crude Catalyst", "f:gregtech:exciteddtcc", 14_514_093, 0.125),
+    new DtpfCatalyst(1, "Excited Dimensionally Transcendent Prosaic Catalyst", "f:gregtech:exciteddtpc", 66_768_460, 0.25),
+    new DtpfCatalyst(2, "Excited Dimensionally Transcendent Resplendent Catalyst", "f:gregtech:exciteddtrc", 269_326_451, 0.5),
+    new DtpfCatalyst(3, "Excited Dimensionally Transcendent Exotic Catalyst", "f:gregtech:exciteddtec", 1_073_007_393, 1.0),
+    new DtpfCatalyst(4, "Excited Dimensionally Transcendent Stellar Catalyst", "f:gregtech:exciteddtsc", 4_276_767_521, 2.0),
+]
+
+let DtpfCatalystByName = Object.fromEntries(DtpfCatalysts.map(cat => [cat.name, cat]));
+
+function findDtpfCatalyst(items:RecipeInOut[]) : DtpfCatalyst | undefined {
+    for (let i=0; i<items.length; i++) {
+        let item = items[i];
+        if (item.type == RecipeIoType.FluidInput) {
+            let name = (item.goods as Fluid).name;
+            if (name in DtpfCatalystByName) {
+                return DtpfCatalystByName[name];
+            }
+        }
+    }
+}
+
 machines["Dimensionally Transcendent Plasma Forge"] = {
     perfectOverclock: (recipe, choices) => choices.convergence > 0 ? MAX_OVERCLOCK : 0,
     speed: 1,
     power: (recipe, choices) => choices.convergence > 0 ? 0.5 : 1,
+    recipe: (recipe, choices, items) => {
+        items = createEditableCopy(items);
+
+        let discount = choices.convergence > 0 ? 0.5 : (choices.discount == 0 ? 0.0 : 0.5);
+
+        if (choices.convergence > 0) {
+            // Logic based on https://github.com/GTNewHorizons/GT5-Unofficial/blob/bdfefcfc4f851a07303cfdde21c26767210ebf57/src/main/java/gregtech/common/tileentities/machines/multi/MTEPlasmaForge.java#L1035-L1041
+            let amperage = recipe.recipe?.gtRecipe.amperage || 1;
+            let voltage = recipe.recipe?.gtRecipe.voltage || TIER_LV;
+            let machineConsumption = amperage * voltage * Math.pow(4, recipe.overclockTiers);
+            let durationTicks = (recipe.recipe?.gtRecipe.durationTicks || 1) / Math.pow(4, recipe.overclockTiers);
+            let requiredCatalystEu = (Math.pow(2, recipe.overclockTiers) - 1) * machineConsumption * durationTicks;
+
+            let catalyst = findDtpfCatalyst(items) || DtpfCatalysts[choices.catalyst];
+
+            let requiredCatalystLiters = requiredCatalystEu / catalyst.euPerLiter;
+            let residueLiters = Math.floor(requiredCatalystLiters * catalyst.residuePerLiter);
+
+            let transdimensionalAlignmentMatrixItem : RecipeInOut = {
+                type : RecipeIoType.ItemInput,
+                goodsPtr : 0,
+                goods : Repository.current.GetById<Item>("i:gregtech:gt.metaitem.03:32758") as Item,
+                slot : 0,
+                amount : 0,
+                probability : 1.0
+            };
+
+            let catalystFluid : RecipeInOut = { 
+                type : RecipeIoType.FluidInput,
+                goodsPtr : 0,
+                goods : Repository.current.GetById<Fluid>(catalyst.id) as Fluid,
+                slot : 0,
+                amount : requiredCatalystLiters,
+                probability : 1.0
+            };
+
+            let residueFluid : RecipeInOut = {
+                type : RecipeIoType.FluidOutput,
+                goodsPtr : 0,
+                goods : Repository.current.GetById<Fluid>("f:gregtech:dimensionallytranscendentresidue") as Fluid,
+                slot : 0,
+                amount : residueLiters,
+                probability : 1.0
+            };
+
+            items.push(transdimensionalAlignmentMatrixItem);
+            items.push(catalystFluid);
+            items.push(residueFluid);
+        }
+        
+        if (discount > 0.0) {
+            for (let i=0; i<items.length; i++) {
+                let item = items[i];
+                if (item.type == RecipeIoType.FluidInput) {
+                    let name = (item.goods as Fluid).name;
+                    if (name in DtpfCatalystByName) {
+                        item.amount *= (1-discount);
+                    }
+                }
+            }
+        }
+
+        return items;
+    },
     parallels: 1,
-    choices: {convergence: {description: "Convergence", choices: ["No Convergence", "Convergence"]}},
-    info: "Extra power cost during Perfect Overclocks is added in form of increased catalyst amounts (Not implemented).",
+    choices: {
+        convergence: {
+            description: "Convergence", choices: ["No Convergence", "Convergence"]
+        },
+        discount: {
+            description: "Discount", choices: ["0%", "50%"]
+        },
+        catalyst: {
+            description: "Catalyst", choices: DtpfCatalysts.map(cat => cat.getCompactName())
+        },
+    },
+    enforceChoiceConstraints: (recipe, choices) => {
+        if (choices.convergence > 0) {
+            choices.discount = 1;
+        }
+
+        let catalyst = findDtpfCatalyst(recipe.recipe?.items || []);
+        if (catalyst) {
+            choices.catalyst = catalyst.tier;
+        }
+    }
 };
 
 machines["Bricked Blast Furnace"] = {
@@ -725,9 +913,9 @@ machines["Large Thermal Refinery"] = {
 };
 
 machines["Transcendent Plasma Mixer"] = {
-    perfectOverclock: 0,
     speed: 1,
-    power: 1,
+    customOverclock: noOverclock,
+    power: 10,
     parallels: (recipe, choices) => choices.parallels,
     choices: {parallels: {description: "Parallels", min: 1}}
 };
@@ -955,8 +1143,6 @@ let leavesMultipliers = [0, 1, 2, 4];
 let fruitsMultipliers = [0, 1];
 
 machines["Tree Growth Simulator"] = {
-    overclockDoesNotAffectSpeed: true,
-    perfectOverclock: 0,
     speed: 1,
     recipe: (recipe, choices, items) => {
         items = createEditableCopy(items);
@@ -977,6 +1163,7 @@ machines["Tree Growth Simulator"] = {
         }
         return items;
     },
+    customOverclock: noOverclock,
     choices: {
         saw: {description: "Saw", choices: ["No saw", "Saw (x1)", "Buzzsaw (x2)", "Chainsaw (x4)"]},
         saplings: {description: "Saplings", choices: ["No grafter", "Branch cutter (x1)", "Grafter (x4)"]},
@@ -1000,4 +1187,107 @@ machines["Large Sifter Control Block"] = {
     speed: 5,
     power: 0.75,
     parallels: (recipe) => (recipe.voltageTier + 1) * 4,
+};
+
+function makeFusionOverclockCalculator(fusionTier:number, overclockMultiplier:number):(recipeModel:RecipeModel, overclockTiers:number) => OverclockResult {
+    return function (recipeModel:RecipeModel, overclockTiers:number): OverclockResult {
+        const recipeTier = Math.max(TIER_LUV, recipeModel.recipe?.gtRecipe?.voltageTier || 0);
+        const perfectOverclocks = Math.max(0, fusionTier - recipeTier);
+        return {
+            overclockSpeed:Math.pow(overclockMultiplier, perfectOverclocks),
+            overclockPower:1,
+            perfectOverclocks:perfectOverclocks,
+            overclockName:overclockMultiplier+"/"+overclockMultiplier+" OC x"+perfectOverclocks
+        };
+    };
+}
+
+machines["Fusion Control Computer Mark I"] = {
+    speed: 1,
+    power: 1,
+    parallels: 1,
+    customOverclock: makeFusionOverclockCalculator(TIER_LUV, 2),
+    info: "Min. energy hatch tier: LUV",
+};
+
+machines["Fusion Control Computer Mark II"] = {
+    speed: 1,
+    power: 1,
+    parallels: 1,
+    customOverclock: makeFusionOverclockCalculator(TIER_ZPM, 2),
+    info: "Min. energy hatch tier: ZPM",
+};
+
+machines["Fusion Control Computer Mark III"] = {
+    speed: 1,
+    power: 1,
+    parallels: 1,
+    customOverclock: makeFusionOverclockCalculator(TIER_UV, 2),
+    info: "Min. energy hatch tier: UV",
+};
+
+machines["FusionTech MK IV"] = {
+    speed: 1,
+    power: 1,
+    parallels: 1,
+    customOverclock: makeFusionOverclockCalculator(TIER_UHV, 4),
+    info: "Min. energy hatch tier: UHV",
+};
+
+machines["FusionTech MK V"] = {
+    speed: 1,
+    power: 1,
+    parallels: 1,
+    customOverclock: makeFusionOverclockCalculator(TIER_UEV, 4),
+    info: "Min. energy hatch tier: UEV",
+};
+
+machines["Compact Fusion Computer MK-I Prototype"] = {
+    speed: 1,
+    power: 1,
+    parallels: 64,
+    customOverclock: makeFusionOverclockCalculator(TIER_LUV, 2),
+    info: "Min. energy hatch tier: LUV",
+};
+
+function getCompactFusionParallel(recipe:RecipeModel, buckets:number[][]) {
+    const startupCost = recipe.getFusionStartupCost();
+    for (const [threshold, parallel] of buckets) {
+        if (startupCost < threshold) {
+            return parallel;
+        }
+    }
+    return 1;
+}
+
+machines["Compact Fusion Computer MK-II"] = {
+    speed: 1,
+    power: 1,
+    parallels: (recipe) => getCompactFusionParallel(recipe, [[160_000_000, 128], [Number.POSITIVE_INFINITY, 64]]),
+    customOverclock: makeFusionOverclockCalculator(TIER_ZPM, 2),
+    info: "Min. energy hatch tier: ZPM",
+};
+
+machines["Compact Fusion Computer MK-III"] = {
+    speed: 1,
+    power: 1,
+    parallels: (recipe) => getCompactFusionParallel(recipe, [[160_000_000, 192], [320_000_000, 128], [Number.POSITIVE_INFINITY, 64]]),
+    customOverclock: makeFusionOverclockCalculator(TIER_UV, 2),
+    info: "Min. energy hatch tier: UV",
+};
+
+machines["Compact Fusion Computer MK-IV Prototype"] = {
+    speed: 1,
+    power: 1,
+    parallels: (recipe) => getCompactFusionParallel(recipe, [[160_000_000, 256], [320_000_000, 192], [640_000_000, 128], [Number.POSITIVE_INFINITY, 64]]),
+    customOverclock: makeFusionOverclockCalculator(TIER_UHV, 4),
+    info: "Min. energy hatch tier: UHV",
+};
+
+machines["Compact Fusion Computer MK-V"] = {
+    speed: 1,
+    power: 1,
+    parallels: (recipe) => getCompactFusionParallel(recipe, [[160_000_000, 320], [320_000_000, 256], [640_000_000, 192], [1_200_000_000, 128], [Number.POSITIVE_INFINITY, 64]]),
+    customOverclock: makeFusionOverclockCalculator(TIER_UEV, 4),
+    info: "Min. energy hatch tier: UEV",
 };

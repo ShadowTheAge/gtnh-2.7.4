@@ -1,4 +1,4 @@
-import { Goods, Item, Recipe, RecipeInOut, RecipeObject } from "./repository.js";
+import { Goods, Item, Recipe, RecipeInOut, RecipeIoType, RecipeObject } from "./repository.js";
 import { SolvePage } from "./solver.js";
 import { showConfirmDialog } from './dialogues.js';
 import { Machine, singleBlockMachine } from "./machines.js";
@@ -203,8 +203,8 @@ export class RecipeModel extends RecipeGroupEntry
     overclockFactor:number = 1;
     powerFactor:number = 1;
     parallels:number = 0;
+    overclockName:string | undefined;
     overclockTiers:number = 0;
-    perfectOverclocks:number = 0;
     selectedOreDicts:{[key:string]:Item} = {};
     machineInfo:Machine = singleBlockMachine;
     multiblockCrafter:Item | null = null;
@@ -236,7 +236,7 @@ export class RecipeModel extends RecipeGroupEntry
         }
     }
 
-    ValidateChoices(machineInfo: Machine): void {
+    ValidateChoices(machineInfo: Machine, recipe: RecipeModel): void {
         if (!machineInfo.choices) {
             this.choices = {};
             return;
@@ -255,8 +255,40 @@ export class RecipeModel extends RecipeGroupEntry
             validatedChoices[key] = Math.min(Math.max(currentValue ?? min, min), max);
         }
 
+        if (machineInfo.enforceChoiceConstraints)
+            machineInfo.enforceChoiceConstraints(recipe, validatedChoices);
+
         this.choices = validatedChoices;
     }
+
+    public getFusionStartupCost(): number {
+        if (this.recipe?.gtRecipe?.additionalInfo) {
+            const regex = /To start:\s*([\d,]+(?:\.\d+)?)/i;
+            const match = this.recipe.gtRecipe.additionalInfo.match(regex);
+    
+            if (match && match[1]) {
+                const numberString = match[1].replace(/,/g, '');
+                return parseInt(numberString);
+            }
+        }
+
+        return 0;
+    }
+
+    public getInputCount(): number {
+        return this.recipeItems.filter((entry) => entry.type in [RecipeIoType.FluidInput, RecipeIoType.ItemInput, RecipeIoType.OreDictInput]).length;
+    }
+
+    public getItemInputCount(): number {
+        return this.recipeItems.filter((entry) => entry.type in [RecipeIoType.ItemInput, RecipeIoType.OreDictInput]).length;
+    }
+}
+
+export type OverclockResult = {
+    overclockSpeed : number;
+    overclockPower : number;
+    perfectOverclocks?: number;
+    overclockName?: string;
 }
 
 export class ProductModel extends ModelObject
